@@ -11,12 +11,12 @@ FROM rust:1.93-alpine3.21 AS builder
 WORKDIR /app
 RUN apk update
 RUN apk add --no-cache musl-dev
-COPY Cargo.toml Cargo.toml
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src/
 RUN echo "fn main() {println!(\"failed to build\")}" > src/main.rs
 RUN cargo build --release
 RUN rm -f target/release/deps/rustypaste*
-COPY . .
+COPY src/ src/
 RUN cargo build --locked --release
 RUN mkdir -p build-out/
 RUN cp target/release/rustypaste build-out/
