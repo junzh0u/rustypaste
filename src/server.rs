@@ -435,6 +435,15 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
                 };
                 let mut file_name = PathBuf::from(e.file_name());
 
+                // Skip hidden files (starting with '.')
+                if file_name
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                {
+                    return None;
+                }
+
                 // Use created time if available, otherwise fall back to modified time
                 // (created time is not available on all filesystems, especially in Docker)
                 let creation_date_utc = metadata
