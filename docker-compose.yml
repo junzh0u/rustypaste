@@ -13,4 +13,3 @@ services:
     volumes:
       - ./upload/:/app/upload
       - ./config.toml:/app/config.toml
-      - ./index.html:/app/index.html
