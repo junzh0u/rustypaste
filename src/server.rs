@@ -148,6 +148,77 @@ async fn serve(
     }
 }
 
+/// Serves the most recently uploaded file.
+#[get("/@last")]
+async fn serve_last(
+    request: HttpRequest,
+    options: Option<web::Query<ServeOptions>>,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
+    let config = config
+        .read()
+        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
+
+    // Find the most recently modified non-expired file in the upload directory
+    let last_file = fs::read_dir(&config.server.upload_path)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            // Skip directories (oneshot/, url/, oneshot_url/)
+            if metadata.is_dir() {
+                return None;
+            }
+
+            let mut file_name = PathBuf::from(e.file_name());
+
+            // Check if file has a timestamp extension (expiration)
+            if let Some(expiration) = file_name
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                // Check if file is expired
+                let system_time = util::get_system_time().ok()?;
+                if system_time > Duration::from_millis(expiration.try_into().ok()?) {
+                    return None; // Skip expired files
+                }
+                // Remove the timestamp extension for the actual filename
+                file_name.set_extension("");
+            }
+
+            let modified = metadata.modified().ok()?;
+            Some((file_name, modified))
+        })
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(file_name, _)| file_name);
+
+    match last_file {
+        Some(file_name) => {
+            let file_name_str = file_name.to_string_lossy().to_string();
+            let path =
+                util::glob_match_file(safe_path_join(&config.server.upload_path, &file_name_str)?)?;
+
+            if !path.is_file() || !path.exists() {
+                return Err(error::ErrorNotFound("no files available\n"));
+            }
+
+            let mime_type = if options.map(|v| v.download).unwrap_or(false) {
+                mime::APPLICATION_OCTET_STREAM
+            } else {
+                mime_util::get_mime_type(&config.paste.mime_override, file_name_str)
+                    .map_err(error::ErrorInternalServerError)?
+            };
+
+            Ok(NamedFile::open(&path)?
+                .disable_content_disposition()
+                .set_content_type(mime_type)
+                .prefer_utf8(true)
+                .into_response(&request))
+        }
+        None => Err(error::ErrorNotFound("no files available\n")),
+    }
+}
+
 /// Remove a file from the upload directory.
 #[delete("/{file}")]
 #[actix_web_grants::protect("TokenType::Delete", ty = TokenType, error = unauthorized_error)]
@@ -410,6 +481,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .service(index)
             .service(version)
             .service(list)
+            .service(serve_last)
             .service(serve)
             .service(upload)
             .service(delete)
