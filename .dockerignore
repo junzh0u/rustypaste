@@ -1,13 +1,7 @@
-# Directories
-/.git/
-/.github/
-/upload/
-/shuttle/
-/examples/
+# Ignore everything by default
+*
 
-# Files
-.gitignore
-*.md
-LICENSE
-config.toml
-index.html
+# Whitelist only what's needed for the build
+!src/
+!Cargo.toml
+!Cargo.lock
