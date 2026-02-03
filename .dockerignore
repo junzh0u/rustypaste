@@ -9,3 +9,4 @@
 .gitignore
 *.md
 LICENSE
+config.toml
