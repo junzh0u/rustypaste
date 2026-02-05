@@ -87,13 +87,18 @@ struct FilterOptions {
 }
 
 impl FilterOptions {
-    /// Returns the upload path based on the filter options.
-    fn get_path(&self, base_path: &std::path::Path) -> std::io::Result<PathBuf> {
-        if self.oneshot {
+    /// Returns an iterator over uploaded files based on filter options.
+    fn get_files(
+        &self,
+        base_path: &std::path::Path,
+    ) -> Result<impl Iterator<Item = UploadedFile>, Error> {
+        let path = if self.oneshot {
             PasteType::Oneshot.get_path(base_path)
         } else {
             Ok(base_path.to_path_buf())
         }
+        .map_err(error::ErrorInternalServerError)?;
+        Ok(get_uploaded_files(&path))
     }
 }
 
@@ -200,20 +205,17 @@ async fn serve_last(
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
 
     let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
-    let upload_path = filter_options
-        .get_path(&config.server.upload_path)
-        .map_err(error::ErrorInternalServerError)?;
 
     // Find the most recently modified non-expired file in the upload directory
-    let last_file = get_uploaded_files(&upload_path)
-        .filter_map(|f| Some((f.file_name, f.metadata.modified().ok()?)))
-        .max_by_key(|(_, modified)| *modified)
-        .map(|(file_name, _)| file_name);
+    let last_file = filter_options
+        .get_files(&config.server.upload_path)?
+        .filter_map(|f| Some((f.file_name, f.path, f.metadata.modified().ok()?)))
+        .max_by_key(|(_, _, modified)| *modified)
+        .map(|(file_name, path, _)| (file_name, path));
 
     match last_file {
-        Some(file_name) => {
+        Some((file_name, path)) => {
             let file_name_str = file_name.to_string_lossy().to_string();
-            let path = util::glob_match_file(safe_path_join(&upload_path, &file_name_str)?)?;
 
             if !path.is_file() || !path.exists() {
                 return Err(error::ErrorNotFound("no files available\n"));
@@ -410,6 +412,8 @@ async fn upload(
 struct UploadedFile {
     /// File name without the expiration timestamp extension.
     file_name: PathBuf,
+    /// Full path to the file on disk.
+    path: PathBuf,
     /// File metadata.
     metadata: fs::Metadata,
     /// Expiration timestamp in milliseconds, if set.
@@ -422,8 +426,8 @@ struct UploadedFile {
 /// - Directories
 /// - Hidden files (starting with '.')
 /// - Expired files
-fn get_uploaded_files(path: &PathBuf) -> impl Iterator<Item = UploadedFile> {
-    fs::read_dir(path)
+fn get_uploaded_files(dir: &PathBuf) -> impl Iterator<Item = UploadedFile> {
+    fs::read_dir(dir)
         .ok()
         .into_iter()
         .flatten()
@@ -434,6 +438,7 @@ fn get_uploaded_files(path: &PathBuf) -> impl Iterator<Item = UploadedFile> {
                 return None;
             }
 
+            let path = e.path();
             let mut file_name = PathBuf::from(e.file_name());
 
             // Skip hidden files (starting with '.')
@@ -457,12 +462,13 @@ fn get_uploaded_files(path: &PathBuf) -> impl Iterator<Item = UploadedFile> {
                 if system_time > Duration::from_millis(expiration.try_into().ok()?) {
                     return None; // Skip expired files
                 }
-                // Remove the timestamp extension for the actual filename
+                // Remove the timestamp extension for the display filename
                 file_name.set_extension("");
             }
 
             Some(UploadedFile {
                 file_name,
+                path,
                 metadata,
                 expiration_millis,
             })
@@ -498,10 +504,8 @@ async fn list(
         Err(error::ErrorNotFound(""))?;
     }
     let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
-    let upload_path = filter_options
-        .get_path(&config.server.upload_path)
-        .map_err(error::ErrorInternalServerError)?;
-    let entries: Vec<ListItem> = get_uploaded_files(&upload_path)
+    let entries: Vec<ListItem> = filter_options
+        .get_files(&config.server.upload_path)?
         .map(|f| {
             // Use created time if available, otherwise fall back to modified time
             // (created time is not available on all filesystems, especially in Docker)
