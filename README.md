@@ -52,6 +52,7 @@ some text
   * [Server](#server)
     * [Authentication](#authentication)
     * [List endpoint](#list-endpoint)
+    * [Last endpoint](#last-endpoint)
     * [HTML Form](#html-form)
     * [Docker](#docker)
     * [Nginx](#nginx)
@@ -313,6 +314,16 @@ Set `expose_list` to true in [config.toml](./config.toml) to be able to retrieve
 $ curl "http://<server_address>/list"
 
 [{"file_name":"accepted-cicada.txt","file_size":241,"expires_at_utc":null}]
+```
+
+This route will require an `AUTH_TOKEN` if one is set.
+
+#### Last endpoint
+
+The `/last` endpoint returns the most recently uploaded file (excluding hidden files, expired files, and oneshot files):
+
+```sh
+$ curl "http://<server_address>/last"
 ```
 
 This route will require an `AUTH_TOKEN` if one is set.

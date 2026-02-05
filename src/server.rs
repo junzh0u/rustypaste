@@ -149,7 +149,7 @@ async fn serve(
 }
 
 /// Serves the most recently uploaded file.
-#[get("/@last")]
+#[get("/last")]
 async fn serve_last(
     request: HttpRequest,
     options: Option<web::Query<ServeOptions>>,
