@@ -110,6 +110,32 @@ fn expire_file(path: &std::path::Path, file_name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Serves a file and optionally expires it (for oneshot files).
+fn serve_file(
+    request: &HttpRequest,
+    path: &std::path::Path,
+    file_name: &str,
+    mime_override: &[mime_util::MimeMatcher],
+    download: bool,
+    is_oneshot: bool,
+) -> Result<HttpResponse, Error> {
+    let mime_type = if download {
+        mime::APPLICATION_OCTET_STREAM
+    } else {
+        mime_util::get_mime_type(mime_override, file_name.to_string())
+            .map_err(error::ErrorInternalServerError)?
+    };
+    let response = NamedFile::open(path)?
+        .disable_content_disposition()
+        .set_content_type(mime_type)
+        .prefer_utf8(true)
+        .into_response(request);
+    if is_oneshot {
+        expire_file(path, file_name)?;
+    }
+    Ok(response)
+}
+
 /// Serves a file from the upload directory.
 #[get("/{file}")]
 async fn serve(
@@ -140,23 +166,14 @@ async fn serve(
         return Err(error::ErrorNotFound("file is not found or expired :(\n"));
     }
     match paste_type {
-        PasteType::File | PasteType::RemoteFile | PasteType::Oneshot => {
-            let mime_type = if options.map(|v| v.download).unwrap_or(false) {
-                mime::APPLICATION_OCTET_STREAM
-            } else {
-                mime_util::get_mime_type(&config.paste.mime_override, file.to_string())
-                    .map_err(error::ErrorInternalServerError)?
-            };
-            let response = NamedFile::open(&path)?
-                .disable_content_disposition()
-                .set_content_type(mime_type)
-                .prefer_utf8(true)
-                .into_response(&request);
-            if paste_type.is_oneshot() {
-                expire_file(&path, &file)?;
-            }
-            Ok(response)
-        }
+        PasteType::File | PasteType::RemoteFile | PasteType::Oneshot => serve_file(
+            &request,
+            &path,
+            &file,
+            &config.paste.mime_override,
+            options.map(|v| v.download).unwrap_or(false),
+            paste_type.is_oneshot(),
+        ),
         PasteType::Url => Ok(HttpResponse::Found()
             .append_header(("Location", fs::read_to_string(&path)?))
             .finish()),
@@ -202,25 +219,14 @@ async fn serve_last(
                 return Err(error::ErrorNotFound("no files available\n"));
             }
 
-            let mime_type = if serve_options.map(|v| v.download).unwrap_or(false) {
-                mime::APPLICATION_OCTET_STREAM
-            } else {
-                mime_util::get_mime_type(&config.paste.mime_override, file_name_str.clone())
-                    .map_err(error::ErrorInternalServerError)?
-            };
-
-            let response = NamedFile::open(&path)?
-                .disable_content_disposition()
-                .set_content_type(mime_type)
-                .prefer_utf8(true)
-                .into_response(&request);
-
-            // Delete the file after serving if it's a oneshot
-            if filter_options.oneshot {
-                expire_file(&path, &file_name_str)?;
-            }
-
-            Ok(response)
+            serve_file(
+                &request,
+                &path,
+                &file_name_str,
+                &config.paste.mime_override,
+                serve_options.map(|v| v.download).unwrap_or(false),
+                filter_options.oneshot,
+            )
         }
         None => Err(error::ErrorNotFound("no files available\n")),
     }
