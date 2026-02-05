@@ -78,6 +78,38 @@ struct ServeOptions {
     download: bool,
 }
 
+/// Filter options for list/last endpoints.
+#[derive(Debug, Default, Deserialize)]
+struct FilterOptions {
+    /// If set to `true`, filter to oneshot files only.
+    #[serde(default)]
+    oneshot: bool,
+}
+
+impl FilterOptions {
+    /// Returns the upload path based on the filter options.
+    fn get_path(&self, base_path: &std::path::Path) -> std::io::Result<PathBuf> {
+        if self.oneshot {
+            PasteType::Oneshot.get_path(base_path)
+        } else {
+            Ok(base_path.to_path_buf())
+        }
+    }
+}
+
+/// Expires a file by renaming it with a timestamp suffix.
+fn expire_file(path: &std::path::Path, file_name: &str) -> Result<(), Error> {
+    fs::rename(
+        path,
+        path.with_file_name(format!(
+            "{}.{}",
+            file_name,
+            util::get_system_time()?.as_millis()
+        )),
+    )?;
+    Ok(())
+}
+
 /// Serves a file from the upload directory.
 #[get("/{file}")]
 async fn serve(
@@ -121,14 +153,7 @@ async fn serve(
                 .prefer_utf8(true)
                 .into_response(&request);
             if paste_type.is_oneshot() {
-                fs::rename(
-                    &path,
-                    path.with_file_name(format!(
-                        "{}.{}",
-                        file,
-                        util::get_system_time()?.as_millis()
-                    )),
-                )?;
+                expire_file(&path, &file)?;
             }
             Ok(response)
         }
@@ -139,10 +164,7 @@ async fn serve(
             let resp = HttpResponse::Found()
                 .append_header(("Location", fs::read_to_string(&path)?))
                 .finish();
-            fs::rename(
-                &path,
-                path.with_file_name(format!("{}.{}", file, util::get_system_time()?.as_millis())),
-            )?;
+            expire_file(&path, &file)?;
             Ok(resp)
         }
     }
@@ -152,15 +174,21 @@ async fn serve(
 #[get("/last")]
 async fn serve_last(
     request: HttpRequest,
-    options: Option<web::Query<ServeOptions>>,
+    serve_options: Option<web::Query<ServeOptions>>,
+    filter_options: Option<web::Query<FilterOptions>>,
     config: web::Data<RwLock<Config>>,
 ) -> Result<HttpResponse, Error> {
     let config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
 
+    let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
+    let upload_path = filter_options
+        .get_path(&config.server.upload_path)
+        .map_err(error::ErrorInternalServerError)?;
+
     // Find the most recently modified non-expired file in the upload directory
-    let last_file = get_uploaded_files(&config.server.upload_path)
+    let last_file = get_uploaded_files(&upload_path)
         .filter_map(|f| Some((f.file_name, f.metadata.modified().ok()?)))
         .max_by_key(|(_, modified)| *modified)
         .map(|(file_name, _)| file_name);
@@ -168,25 +196,31 @@ async fn serve_last(
     match last_file {
         Some(file_name) => {
             let file_name_str = file_name.to_string_lossy().to_string();
-            let path =
-                util::glob_match_file(safe_path_join(&config.server.upload_path, &file_name_str)?)?;
+            let path = util::glob_match_file(safe_path_join(&upload_path, &file_name_str)?)?;
 
             if !path.is_file() || !path.exists() {
                 return Err(error::ErrorNotFound("no files available\n"));
             }
 
-            let mime_type = if options.map(|v| v.download).unwrap_or(false) {
+            let mime_type = if serve_options.map(|v| v.download).unwrap_or(false) {
                 mime::APPLICATION_OCTET_STREAM
             } else {
-                mime_util::get_mime_type(&config.paste.mime_override, file_name_str)
+                mime_util::get_mime_type(&config.paste.mime_override, file_name_str.clone())
                     .map_err(error::ErrorInternalServerError)?
             };
 
-            Ok(NamedFile::open(&path)?
+            let response = NamedFile::open(&path)?
                 .disable_content_disposition()
                 .set_content_type(mime_type)
                 .prefer_utf8(true)
-                .into_response(&request))
+                .into_response(&request);
+
+            // Delete the file after serving if it's a oneshot
+            if filter_options.oneshot {
+                expire_file(&path, &file_name_str)?;
+            }
+
+            Ok(response)
         }
         None => Err(error::ErrorNotFound("no files available\n")),
     }
@@ -445,7 +479,10 @@ pub struct ListItem {
 /// Returns the list of files.
 #[get("/list")]
 #[actix_web_grants::protect("TokenType::Auth", ty = TokenType, error = unauthorized_error)]
-async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> {
+async fn list(
+    filter_options: Option<web::Query<FilterOptions>>,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
     let config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
@@ -454,7 +491,11 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
         warn!("server is not configured to expose list endpoint");
         Err(error::ErrorNotFound(""))?;
     }
-    let entries: Vec<ListItem> = get_uploaded_files(&config.server.upload_path)
+    let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
+    let upload_path = filter_options
+        .get_path(&config.server.upload_path)
+        .map_err(error::ErrorInternalServerError)?;
+    let entries: Vec<ListItem> = get_uploaded_files(&upload_path)
         .map(|f| {
             // Use created time if available, otherwise fall back to modified time
             // (created time is not available on all filesystems, especially in Docker)
@@ -475,9 +516,9 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
                     .as_string()
                 });
 
-            let expires_at_utc =
-                f.expiration_millis
-                    .map(|exp| uts2ts::uts2ts(exp / 1000).as_string());
+            let expires_at_utc = f
+                .expiration_millis
+                .map(|exp| uts2ts::uts2ts(exp / 1000).as_string());
 
             ListItem {
                 file_name: f.file_name,
