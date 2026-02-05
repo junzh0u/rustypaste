@@ -160,35 +160,8 @@ async fn serve_last(
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
 
     // Find the most recently modified non-expired file in the upload directory
-    let last_file = fs::read_dir(&config.server.upload_path)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|e| {
-            let metadata = e.metadata().ok()?;
-            // Skip directories (oneshot/, url/, oneshot_url/)
-            if metadata.is_dir() {
-                return None;
-            }
-
-            let mut file_name = PathBuf::from(e.file_name());
-
-            // Check if file has a timestamp extension (expiration)
-            if let Some(expiration) = file_name
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .and_then(|v| v.parse::<i64>().ok())
-            {
-                // Check if file is expired
-                let system_time = util::get_system_time().ok()?;
-                if system_time > Duration::from_millis(expiration.try_into().ok()?) {
-                    return None; // Skip expired files
-                }
-                // Remove the timestamp extension for the actual filename
-                file_name.set_extension("");
-            }
-
-            let modified = metadata.modified().ok()?;
-            Some((file_name, modified))
-        })
+    let last_file = get_uploaded_files(&config.server.upload_path)
+        .filter_map(|f| Some((f.file_name, f.metadata.modified().ok()?)))
         .max_by_key(|(_, modified)| *modified)
         .map(|(file_name, _)| file_name);
 
@@ -393,6 +366,69 @@ async fn upload(
     Ok(HttpResponse::Ok().body(urls.join("")))
 }
 
+/// Represents a valid (non-expired, non-hidden) uploaded file.
+struct UploadedFile {
+    /// File name without the expiration timestamp extension.
+    file_name: PathBuf,
+    /// File metadata.
+    metadata: fs::Metadata,
+    /// Expiration timestamp in milliseconds, if set.
+    expiration_millis: Option<i64>,
+}
+
+/// Returns an iterator over valid uploaded files in the given directory.
+///
+/// Filters out:
+/// - Directories
+/// - Hidden files (starting with '.')
+/// - Expired files
+fn get_uploaded_files(path: &PathBuf) -> impl Iterator<Item = UploadedFile> {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            if metadata.is_dir() {
+                return None;
+            }
+
+            let mut file_name = PathBuf::from(e.file_name());
+
+            // Skip hidden files (starting with '.')
+            if file_name
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+            {
+                return None;
+            }
+
+            // Check if file has a timestamp extension (expiration)
+            let expiration_millis = file_name
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(|v| v.parse::<i64>().ok());
+
+            if let Some(expiration) = expiration_millis {
+                // Check if file is expired
+                let system_time = util::get_system_time().ok()?;
+                if system_time > Duration::from_millis(expiration.try_into().ok()?) {
+                    return None; // Skip expired files
+                }
+                // Remove the timestamp extension for the actual filename
+                file_name.set_extension("");
+            }
+
+            Some(UploadedFile {
+                file_name,
+                metadata,
+                expiration_millis,
+            })
+        })
+}
+
 /// File entry item for list endpoint.
 #[derive(Serialize, Deserialize)]
 pub struct ListItem {
@@ -418,73 +454,37 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
         warn!("server is not configured to expose list endpoint");
         Err(error::ErrorNotFound(""))?;
     }
-    let entries: Vec<ListItem> = fs::read_dir(config.server.upload_path)?
-        .filter_map(|entry| {
-            entry.ok().and_then(|e| {
-                let metadata = match e.metadata() {
-                    Ok(metadata) => {
-                        if metadata.is_dir() {
-                            return None;
-                        }
-                        metadata
-                    }
-                    Err(e) => {
-                        error!("failed to read metadata: {e}");
-                        return None;
-                    }
-                };
-                let mut file_name = PathBuf::from(e.file_name());
+    let entries: Vec<ListItem> = get_uploaded_files(&config.server.upload_path)
+        .map(|f| {
+            // Use created time if available, otherwise fall back to modified time
+            // (created time is not available on all filesystems, especially in Docker)
+            let creation_date_utc = f
+                .metadata
+                .created()
+                .or_else(|_| f.metadata.modified())
+                .ok()
+                .map(|v| {
+                    let millis = v
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time since UNIX epoch should be valid.")
+                        .as_millis();
+                    uts2ts::uts2ts(
+                        i64::try_from(millis).expect("UNIX time should be smaller than i64::MAX")
+                            / 1000,
+                    )
+                    .as_string()
+                });
 
-                // Skip hidden files (starting with '.')
-                if file_name
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with('.'))
-                {
-                    return None;
-                }
+            let expires_at_utc =
+                f.expiration_millis
+                    .map(|exp| uts2ts::uts2ts(exp / 1000).as_string());
 
-                // Use created time if available, otherwise fall back to modified time
-                // (created time is not available on all filesystems, especially in Docker)
-                let creation_date_utc = metadata
-                    .created()
-                    .or_else(|_| metadata.modified())
-                    .ok()
-                    .map(|v| {
-                        let millis = v
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Time since UNIX epoch should be valid.")
-                            .as_millis();
-                        uts2ts::uts2ts(
-                            i64::try_from(millis)
-                                .expect("UNIX time should be smaller than i64::MAX")
-                                / 1000,
-                        )
-                        .as_string()
-                    });
-
-                let expires_at_utc = if let Some(expiration) = file_name
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(|v| v.parse::<i64>().ok())
-                {
-                    file_name.set_extension("");
-                    if util::get_system_time().ok()?
-                        > Duration::from_millis(expiration.try_into().ok()?)
-                    {
-                        return None;
-                    }
-                    Some(uts2ts::uts2ts(expiration / 1000).as_string())
-                } else {
-                    None
-                };
-                Some(ListItem {
-                    file_name,
-                    file_size: metadata.len(),
-                    creation_date_utc,
-                    expires_at_utc,
-                })
-            })
+            ListItem {
+                file_name: f.file_name,
+                file_size: f.metadata.len(),
+                creation_date_utc,
+                expires_at_utc,
+            }
         })
         .collect();
     Ok(HttpResponse::Ok().json(entries))
