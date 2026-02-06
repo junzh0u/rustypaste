@@ -2,6 +2,7 @@ use actix_web::http::header::{
     ContentDisposition as ActixContentDisposition, DispositionParam, DispositionType, HeaderMap,
 };
 use actix_web::{error, Error as ActixError};
+use percent_encoding::percent_decode_str;
 use std::time::Duration;
 
 /// Custom HTTP header for expiry dates.
@@ -22,9 +23,15 @@ pub fn parse_expiry_date(headers: &HeaderMap, time: Duration) -> Result<Option<u
 }
 
 /// Parses the filename from the header.
+///
+/// The filename may be percent-encoded (e.g. for unicode filenames),
+/// so we decode it back to UTF-8.
 pub fn parse_header_filename(headers: &HeaderMap) -> Result<Option<String>, ActixError> {
     if let Some(file_name) = headers.get(FILENAME).and_then(|v| v.to_str().ok()) {
-        Ok(Some(file_name.to_string()))
+        let decoded = percent_decode_str(file_name)
+            .decode_utf8()
+            .map_err(error::ErrorBadRequest)?;
+        Ok(Some(decoded.into_owned()))
     } else {
         Ok(None)
     }
@@ -98,6 +105,54 @@ mod tests {
         let content_disposition = ContentDisposition::from(actix_content_disposition);
         assert!(!content_disposition.has_form_field("file"));
         assert!(content_disposition.get_file_name().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_header_filename_ascii() -> Result<(), ActixError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(FILENAME),
+            HeaderValue::from_static("hello.txt"),
+        );
+        let result = parse_header_filename(&headers)?;
+        assert_eq!(result, Some("hello.txt".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_header_filename_unicode() -> Result<(), ActixError> {
+        let mut headers = HeaderMap::new();
+        // "测试文件.txt" percent-encoded
+        headers.insert(
+            HeaderName::from_static(FILENAME),
+            HeaderValue::from_static(
+                "%E6%B5%8B%E8%AF%95%E6%96%87%E4%BB%B6.txt",
+            ),
+        );
+        let result = parse_header_filename(&headers)?;
+        assert_eq!(result, Some("测试文件.txt".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_header_filename_emoji() -> Result<(), ActixError> {
+        let mut headers = HeaderMap::new();
+        // "📎attachment.zip" percent-encoded
+        headers.insert(
+            HeaderName::from_static(FILENAME),
+            HeaderValue::from_static("%F0%9F%93%8Eattachment.zip"),
+        );
+        let result = parse_header_filename(&headers)?;
+        assert_eq!(result, Some("📎attachment.zip".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_header_filename_none() -> Result<(), ActixError> {
+        let headers = HeaderMap::new();
+        let result = parse_header_filename(&headers)?;
+        assert_eq!(result, None);
         Ok(())
     }
 
