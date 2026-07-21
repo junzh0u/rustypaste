@@ -5,3 +5,9 @@
 !src/
 !Cargo.toml
 !Cargo.lock
+
+# UI source for building index.html
+!ui/
+ui/node_modules/
+ui/dist/
+ui/.git
