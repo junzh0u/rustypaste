@@ -60,6 +60,18 @@ Build with specific features: `cargo build --release --no-default-features --fea
 | `middleware.rs` | Content-Length limiter middleware |
 | `header.rs` | Custom header parsing (expire, filename) |
 
+### API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Landing page (redirects to homepage or shows custom page) |
+| `/` | POST | Upload file(s) via multipart form |
+| `/{file}` | GET | Serve/download a file |
+| `/{file}` | DELETE | Delete a file (requires delete token) |
+| `/list` | GET | List uploaded files as JSON (requires `expose_list` config) |
+| `/last` | GET | Serve the most recently uploaded file |
+| `/version` | GET | Show server version (requires `expose_version` config) |
+
 ### Key Concepts
 
 - **PasteType**: `File`, `RemoteFile`, `Oneshot`, `Url`, `OneshotUrl` - stored in different subdirectories

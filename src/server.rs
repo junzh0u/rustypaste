@@ -98,6 +98,75 @@ struct ServeOptions {
     download: bool,
 }
 
+/// Filter options for list/last endpoints.
+#[derive(Debug, Default, Deserialize)]
+struct FilterOptions {
+    /// If set to `true`, filter to oneshot files only.
+    #[serde(default)]
+    oneshot: bool,
+}
+
+impl FilterOptions {
+    /// Returns an iterator over uploaded files based on filter options.
+    fn get_files(
+        &self,
+        base_path: &std::path::Path,
+    ) -> Result<impl Iterator<Item = UploadedFile>, Error> {
+        let path = if self.oneshot {
+            PasteType::Oneshot.get_path(base_path)
+        } else {
+            Ok(base_path.to_path_buf())
+        }
+        .map_err(error::ErrorInternalServerError)?;
+        Ok(get_uploaded_files(&path))
+    }
+}
+
+/// Expires a file by renaming it with a timestamp suffix.
+fn expire_file(path: &std::path::Path, file_name: &str) -> Result<(), Error> {
+    fs::rename(
+        path,
+        path.with_file_name(format!(
+            "{}.{}",
+            file_name,
+            util::get_system_time()?.as_millis()
+        )),
+    )?;
+    Ok(())
+}
+
+/// Serves a file and optionally expires it (for oneshot files).
+fn serve_file(
+    request: &HttpRequest,
+    path: &std::path::Path,
+    file_name: &str,
+    config: &Config,
+    download: bool,
+    is_oneshot: bool,
+) -> Result<HttpResponse, Error> {
+    let mut mime_type = if download {
+        mime::APPLICATION_OCTET_STREAM
+    } else {
+        mime_util::get_mime_type(&config.paste.mime_override, file_name.to_string())
+            .map_err(error::ErrorInternalServerError)?
+    };
+    if !download && is_text_like_mime(&mime_type, &config.paste.text_mime_overrides) {
+        mime_type = TEXT_PLAIN_UTF_8;
+    }
+    let mut response = NamedFile::open(path)?
+        .disable_content_disposition()
+        .set_content_type(mime_type)
+        .prefer_utf8(true)
+        .into_response(request);
+    if config.server.hardening.unwrap_or(false) {
+        apply_security_headers(&mut response);
+    }
+    if is_oneshot {
+        expire_file(path, file_name)?;
+    }
+    Ok(response)
+}
+
 /// Serves a file from the upload directory.
 #[route("/{file}", method = "GET", method = "HEAD")]
 async fn serve(
@@ -154,37 +223,14 @@ async fn serve(
 
     match paste_type {
         PasteType::File | PasteType::RemoteFile | PasteType::Oneshot | PasteType::ProtectedFile => {
-            let should_download = options.map(|v| v.download).unwrap_or(false);
-
-            let mut mime_type = if should_download {
-                mime::APPLICATION_OCTET_STREAM
-            } else {
-                mime_util::get_mime_type(&config.paste.mime_override, file.to_string())
-                    .map_err(error::ErrorInternalServerError)?
-            };
-            if !should_download && is_text_like_mime(&mime_type, &config.paste.text_mime_overrides)
-            {
-                mime_type = TEXT_PLAIN_UTF_8;
-            }
-            let mut response = NamedFile::open(&path)?
-                .disable_content_disposition()
-                .set_content_type(mime_type)
-                .prefer_utf8(true)
-                .into_response(&request);
-            if config.server.hardening.unwrap_or(false) {
-                apply_security_headers(&mut response);
-            }
-            if paste_type.is_oneshot() {
-                fs::rename(
-                    &path,
-                    path.with_file_name(format!(
-                        "{}.{}",
-                        file,
-                        util::get_system_time()?.as_millis()
-                    )),
-                )?;
-            }
-            Ok(response)
+            serve_file(
+                &request,
+                &path,
+                &file,
+                &config,
+                options.map(|v| v.download).unwrap_or(false),
+                paste_type.is_oneshot(),
+            )
         }
         PasteType::Url => Ok(HttpResponse::Found()
             .append_header(("Location", fs::read_to_string(&path)?))
@@ -193,10 +239,7 @@ async fn serve(
             let resp = HttpResponse::Found()
                 .append_header(("Location", fs::read_to_string(&path)?))
                 .finish();
-            fs::rename(
-                &path,
-                path.with_file_name(format!("{}.{}", file, util::get_system_time()?.as_millis())),
-            )?;
+            expire_file(&path, &file)?;
             Ok(resp)
         }
     }
@@ -247,6 +290,48 @@ fn is_text_like_mime(mime_type: &mime::Mime, overrides: &[String]) -> bool {
             | "application/x-javascript"
             | "application/xml"
     )
+}
+
+/// Serves the most recently uploaded file.
+#[get("/last")]
+async fn serve_last(
+    request: HttpRequest,
+    serve_options: Option<web::Query<ServeOptions>>,
+    filter_options: Option<web::Query<FilterOptions>>,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
+    let config = config
+        .read()
+        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
+
+    let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
+
+    // Find the most recently modified non-expired file in the upload directory
+    let last_file = filter_options
+        .get_files(&config.server.upload_path)?
+        .filter_map(|f| Some((f.file_name, f.path, f.metadata.modified().ok()?)))
+        .max_by_key(|(_, _, modified)| *modified)
+        .map(|(file_name, path, _)| (file_name, path));
+
+    match last_file {
+        Some((file_name, path)) => {
+            let file_name_str = file_name.to_string_lossy().to_string();
+
+            if !path.is_file() || !path.exists() {
+                return Err(error::ErrorNotFound("no files available\n"));
+            }
+
+            serve_file(
+                &request,
+                &path,
+                &file_name_str,
+                &config,
+                serve_options.map(|v| v.download).unwrap_or(false),
+                filter_options.oneshot,
+            )
+        }
+        None => Err(error::ErrorNotFound("no files available\n")),
+    }
 }
 
 /// Remove a file from the upload directory.
@@ -453,6 +538,70 @@ async fn upload(
     Ok(HttpResponse::Ok().body(urls.join("")))
 }
 
+/// Represents a valid (non-expired, non-hidden) uploaded file.
+struct UploadedFile {
+    /// File name without the expiration timestamp extension.
+    file_name: PathBuf,
+    /// Full path to the file on disk.
+    path: PathBuf,
+    /// File metadata.
+    metadata: fs::Metadata,
+}
+
+/// Returns an iterator over valid uploaded files in the given directory.
+///
+/// Filters out:
+/// - Directories
+/// - Hidden files (starting with '.')
+/// - Expired files
+fn get_uploaded_files(dir: &PathBuf) -> impl Iterator<Item = UploadedFile> {
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            if metadata.is_dir() {
+                return None;
+            }
+
+            let path = e.path();
+            let mut file_name = PathBuf::from(e.file_name());
+
+            // Skip hidden files (starting with '.')
+            if file_name
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+            {
+                return None;
+            }
+
+            // Check if file has a timestamp extension (expiration)
+            let expiration_millis = file_name
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(|v| v.parse::<i64>().ok());
+
+            if let Some(expiration) = expiration_millis {
+                // Check if file is expired
+                let system_time = util::get_system_time().ok()?;
+                if system_time > Duration::from_millis(expiration.try_into().ok()?) {
+                    return None; // Skip expired files
+                }
+                // Remove the timestamp extension for the display filename
+                file_name.set_extension("");
+            }
+
+            Some(UploadedFile {
+                file_name,
+                path,
+                metadata,
+            })
+        })
+}
+
 /// File entry item for list endpoint.
 #[derive(Serialize, Deserialize)]
 pub struct ListItem {
@@ -471,7 +620,10 @@ pub struct ListItem {
 /// Returns the list of files.
 #[get("/list")]
 #[actix_web_grants::protect("TokenType::Auth", ty = TokenType, error = unauthorized_error)]
-async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> {
+async fn list(
+    filter_options: Option<web::Query<FilterOptions>>,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
     let config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
@@ -480,6 +632,7 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
         warn!("server is not configured to expose list endpoint");
         Err(error::ErrorNotFound(""))?;
     }
+    let filter_options = filter_options.map(|v| v.into_inner()).unwrap_or_default();
 
     let get_item_list = |item_type: PasteType| -> Result<Vec<ListItem>, Error> {
         let dir = item_type.get_path(&config.server.upload_path)?;
@@ -504,19 +657,28 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
                         }
                     };
                     let mut file_name = PathBuf::from(e.file_name());
+                    if file_name.to_string_lossy().starts_with('.') {
+                        return None;
+                    }
 
-                    let creation_date_utc = metadata.created().ok().map(|v| {
-                        let millis = v
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Time since UNIX epoch should be valid.")
-                            .as_millis();
-                        uts2ts::uts2ts(
-                            i64::try_from(millis)
-                                .expect("UNIX time should be smaller than i64::MAX")
-                                / 1000,
-                        )
-                        .as_string()
-                    });
+                    // Use created time if available, otherwise fall back to modified
+                    // time (created time is unavailable on some filesystems, e.g. Docker)
+                    let creation_date_utc = metadata
+                        .created()
+                        .or_else(|_| metadata.modified())
+                        .ok()
+                        .map(|v| {
+                            let millis = v
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time since UNIX epoch should be valid.")
+                                .as_millis();
+                            uts2ts::uts2ts(
+                                i64::try_from(millis)
+                                    .expect("UNIX time should be smaller than i64::MAX")
+                                    / 1000,
+                            )
+                            .as_string()
+                        });
 
                     let expires_at_utc = if let Some(expiration) = file_name
                         .extension()
@@ -550,6 +712,7 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
 
     let entries: Vec<ListItem> = PASTE_VARIANTS_LIST
         .iter()
+        .filter(|variant| !filter_options.oneshot || **variant == PasteType::Oneshot)
         .map(|variant| get_item_list(*variant))
         .collect::<Result<Vec<Vec<ListItem>>, Error>>()?
         .into_iter()
@@ -566,6 +729,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .service(index)
             .service(version)
             .service(list)
+            .service(serve_last)
             .service(serve)
             .service(upload)
             .service(delete)
