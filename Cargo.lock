@@ -2109,6 +2109,7 @@ dependencies = [
  "mime",
  "mime_guess",
  "path-clean",
+ "percent-encoding",
  "petname",
  "rand 0.10.2",
  "regex",

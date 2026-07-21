@@ -47,8 +47,8 @@ main() {
     done
   else
   # Otherwise, run all fixtures
-    find * -maxdepth 0 -type d -print0 | while IFS= read -r -d '' fixture; do
-      process_fixture "$fixture"
+    find "$FIXTURE_DIR" -maxdepth 1 -mindepth 1 -type d -print0 | while IFS= read -r -d '' fixture; do
+      process_fixture "$(basename "$fixture")"
     done
   fi
 }
